@@ -14,6 +14,7 @@
 # limitations under the License.
 
 
+import gc
 import av
 import cv2
 import numpy as np
@@ -289,7 +290,14 @@ def get_frames_by_timestamps(
                 if hasattr(reader, 'container'):
                     reader.container.close()
                     reader.container = None
-        
+            # torchvision_av (pyav) VideoReader leaks the per-stream codec context on
+            # reference cycles; without forcing collection it accumulates native mmaps
+            # until avcodec_open2 fails with ENOMEM (~1654 reads on a 655300 max_map_count
+            # box). Drop the reader ref + force a cycle collection so the codec context is
+            # freed now, not at the next (too-infrequent) automatic GC.
+            reader = None
+            gc.collect(0)  # gen-0 only: cheap, and the just-abandoned reader cycle is gen-0
+
         frames = np.array(loaded_frames)
         return frames.transpose(0, 2, 3, 1)
     else:
