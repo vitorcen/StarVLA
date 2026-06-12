@@ -1374,9 +1374,9 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        return self._pack_sample(data, base_index=base_index)
 
-    def _pack_sample(self, data: dict) -> dict:
+    def _pack_sample(self, data: dict, base_index: int = 0) -> dict:
         """Pack transformed modality data into training sample format."""
         step_images = []
         for video_key in self.modality_keys["video"]:
@@ -1412,6 +1412,36 @@ class LeRobotSingleDataset(Dataset):
             else:
                 state = np.concatenate(state, axis=1).astype(np.float16)
                 sample["state"] = state
+
+            # Proprio history: load K previous frames' states from trajectory data
+            n_hist = int(self.data_cfg.get("proprio_history", 0)) if self.data_cfg else 0
+            state_keys = self.modality_keys.get("state", [])
+            if n_hist > 0 and self.curr_traj_data is not None and len(state_keys) > 0:
+                traj_len = len(self.curr_traj_data)
+                le_state_cfg = getattr(self.lerobot_modality_meta, "state", {})
+                # Pre-compute column lookup for each state key
+                col_info = []
+                for state_key in state_keys:
+                    base_key = state_key.replace("state.", "")
+                    if base_key in le_state_cfg:
+                        cfg = le_state_cfg[base_key]
+                        if cfg.original_key is not None and cfg.original_key in self.curr_traj_data.columns:
+                            col_data = np.stack(self.curr_traj_data[cfg.original_key])
+                            col_info.append((col_data, list(range(cfg.start, cfg.end))))
+                            continue
+                    col_info.append(None)  # fallback: use current frame data
+                hist_states = []
+                for offset in range(-n_hist + 1, 1):  # -K+1, -K+2, ..., 0
+                    fi = max(0, min(base_index + offset, traj_len - 1))
+                    frame_parts = []
+                    for i, state_key in enumerate(state_keys):
+                        if col_info[i] is not None:
+                            col_data, le_indices = col_info[i]
+                            frame_parts.append(col_data[fi, le_indices])
+                        else:
+                            frame_parts.append(data[state_key][0])
+                    hist_states.append(np.concatenate(frame_parts).astype(np.float16))
+                sample["state_history"] = np.stack(hist_states)  # (K, state_dim)
 
         return sample
 
