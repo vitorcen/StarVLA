@@ -1381,7 +1381,7 @@ class LeRobotSingleDataset(Dataset):
         step_images = []
         for video_key in self.modality_keys["video"]:
             image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
+            image = Image.fromarray(image).resize((448, 448))
             step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
