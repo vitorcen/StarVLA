@@ -39,8 +39,10 @@ _当前相对上游 `starVLA_dev` 的改动（拉新版后 `git rebase upstream/
 | `fix: pyav codec gc` | `dataloader/gr00t_lerobot/video.py` | VideoReader leaks native mmaps → `avcodec_open2` ENOMEM |
 | `feat: proprio history` | `dataloader/gr00t_lerobot/datasets.py` | config-gated (default 0 = no-op); LeSONIC P0 experiment |
 | `feat: QwenPI_CE head` | `starVLA/model/framework/VLM4A/QwenPI_CE.py` | **new file**, FSQ-aware CE head for SONIC motion tokens |
+| `feat: QwenGR00T_N17 head` | `model/modules/action_model/GR00T_N17_ActionHeader.py`, `model/framework/VLM4A/QwenGR00T_N17.py` | **new files**, GR00T N1.7-style head (VLLN + AlternateVLDiT + state dropout, no future tokens) for LeIsaac PickOrange ("GR00T_v2" in docs/model names). NOT named `QwenGR00T_v2`: upstream gitignores that exact path (`.gitignore:264`, their WIP) — taking it would collide on a future rebase and on the framework registry key. |
 
 When syncing to a newer upstream: rebase this branch onto the new base; the new
-file (`QwenPI_CE.py`) and the config-gated additions carry over cleanly, only the
-in-place edits to `datasets.py` / `__init__.py` / `train_starvla.py` / `video.py`
-may need a 3-way merge.
+files (`QwenPI_CE.py`, `QwenGR00T_N17.py`, `GR00T_N17_ActionHeader.py`) and the
+config-gated additions carry over cleanly, only the in-place edits to
+`datasets.py` / `__init__.py` / `train_starvla.py` / `video.py` may need a
+3-way merge.
