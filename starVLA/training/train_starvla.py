@@ -144,6 +144,11 @@ class VLATrainer(TrainerUtils):
             else None
         )
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
+        # GR00T N1.6-style partial unfreeze: a framework may re-enable grad on its
+        # top-N VLM layers AFTER the by-name freeze (e.g. QwenGR00T_N17 +
+        # qwenvl.tune_top_llm_layers). Generic no-op for frameworks without the method.
+        if hasattr(self.model, "apply_partial_unfreeze"):
+            self.model.apply_partial_unfreeze()
         self.print_trainable_parameters(self.model)
 
         self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
@@ -454,7 +459,46 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+
+    # Freeze + (optional) partial-unfreeze BEFORE building the optimizer so that
+    # build_param_lr_groups sees the final requires_grad state. Otherwise the optimizer is
+    # built while the whole VLM is still trainable / before unfreeze, and the unfrozen top-N
+    # layers never enter any param group (silent no-op). Idempotent with the identical calls
+    # in VLATrainer.prepare_training() (which still run, harmlessly, post-distributed-setup).
+    _freeze_modules = cfg.trainer.get("freeze_modules", None) if hasattr(cfg, "trainer") else None
+    vla = TrainerUtils.freeze_backbones(vla, freeze_modules=_freeze_modules)
+    if hasattr(vla, "apply_partial_unfreeze"):
+        vla.apply_partial_unfreeze()
+
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
+
+    # V1 sanity: every unfrozen VLM param MUST be inside the optimizer, else partial unfreeze
+    # is a silent no-op (the old name-based build_param_lr_groups bug). Cheap, fail-fast.
+    _opt_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
+    _unfrozen = [(n, p) for n, p in vla.named_parameters() if p.requires_grad and "qwen_vl_interface" in n]
+    try:
+        _want_unfreeze = int(getattr(cfg.framework.qwenvl, "tune_top_llm_layers", 0) or 0)
+    except Exception:
+        _want_unfreeze = 0
+    if _want_unfreeze > 0:
+        # Configured to unfreeze but ZERO trainable VLM params => apply_partial_unfreeze() failed
+        # to locate the LLM layers (e.g. backbone path changed) => silent no-op. Fail fast rather
+        # than burn another head-only run. (codex review fix #1)
+        assert _unfrozen, (
+            f"❌ tune_top_llm_layers={_want_unfreeze} but ZERO qwen_vl_interface params are "
+            f"trainable — apply_partial_unfreeze() located no LLM layers (silent no-op)."
+        )
+    if _unfrozen:
+        _missing = [n for n, p in _unfrozen if id(p) not in _opt_ids]
+        assert not _missing, (
+            f"❌ partial-unfreeze no-op: {len(_missing)} unfrozen VLM params are NOT in the "
+            f"optimizer (e.g. {_missing[:3]}). build_param_lr_groups must filter by requires_grad."
+        )
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info(
+                f"✅ partial-unfreeze OK: {len(_unfrozen)} unfrozen VLM params, all in optimizer; "
+                f"groups={[(g['name'], g['lr'], len(g['params'])) for g in optimizer.param_groups]}"
+            )
 
     trainer = VLATrainer(
         cfg=cfg,

@@ -101,43 +101,38 @@ def build_param_lr_groups(model, cfg):
     lr_cfg = cfg.trainer.learning_rate
     base_lr = lr_cfg.get("base", 1e-4)  # default base learning rate
 
-    freeze_modules = cfg.trainer.get("freeze_modules", "")
-    if not isinstance(freeze_modules, str):
-        freeze_modules = ""
-    freeze_patterns = [p.strip() for p in freeze_modules.split(",") if p.strip()]
-
+    # SOURCE OF TRUTH = requires_grad, set by freeze_backbones + apply_partial_unfreeze
+    # which run BEFORE this (see train_starvla.main). We must NOT exclude by freeze_modules
+    # NAME: a layer that lives under a name-frozen module (e.g. qwen_vl_interface) but was
+    # deliberately re-enabled by a partial unfreeze has requires_grad=True and MUST enter the
+    # optimizer. The old name-based exclusion silently dropped such layers => partial unfreeze
+    # was a no-op. A fully-frozen named module simply yields [] here and is skipped, so the
+    # frozen head-only default (tune_top_llm_layers=0) behaves exactly as before.
     used_params = set()
-    frozen_params = set()
     param_groups = []
 
-    for freeze_path in freeze_patterns:
-        module = model
-        try:
-            for attr in freeze_path.split("."):
-                module = getattr(module, attr)
-            frozen_params.update(id(p) for p in module.parameters())
-        except AttributeError:
-            print(f"⚠️ freeze module path does not exist: {freeze_path}")
-            continue
-
+    # PRECEDENCE: groups are built in lr_cfg key order and `used_params` makes it FIRST-MATCH-WINS
+    # — a param claimed by an earlier (broader) named group will NOT be re-claimed by a later
+    # (nested) one. If you ever need a nested submodule to get a different lr than its parent
+    # module, put the nested key BEFORE the parent key in the config. (codex review note #2)
     for module_name, lr in lr_cfg.items():
         if module_name == "base":
             continue
-        # try to find the module under vla by module_name (support nested paths)
+        # locate the module under model by (possibly nested) name
         module = model
         try:
             for attr in module_name.split("."):
                 module = getattr(module, attr)
-            # filter out frozen parameters
-            params = [p for p in module.parameters() if id(p) not in frozen_params]
-            if params:  # only add param group if there are trainable parameters
-                param_groups.append({"params": params, "lr": lr, "name": module_name})
-                used_params.update(id(p) for p in params)
         except AttributeError:
-            ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
+            print(f"⚠️ module path `{module_name}` not found in model")
+            continue
+        params = [p for p in module.parameters() if p.requires_grad and id(p) not in used_params]
+        if params:  # only add a group if this module has TRAINABLE params
+            param_groups.append({"params": params, "lr": lr, "name": module_name})
+            used_params.update(id(p) for p in params)
 
-    # assign base learning rate to the remaining unused parameters (exclude frozen ones)
-    other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params]
+    # base group = remaining trainable params not claimed by a named group
+    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in used_params]
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
 

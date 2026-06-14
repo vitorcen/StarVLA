@@ -57,6 +57,29 @@ class QwenGR00TN17DefaultConfig:
             "base_vlm": "./playground/Pretrained_models/Qwen3-VL-4B-Instruct",
             "attn_implementation": "flash_attention_2",
             "vl_hidden_dim": 2048,
+            # Partial-unfreeze (GR00T N1.6-style): with freeze_modules=qwen_vl_interface
+            # the whole VLM is frozen first; if >0, the framework re-enables grad on the
+            # TOP N Qwen3-VL LLM transformer layers (head + top-N co-trained). 0 = fully
+            # frozen head-only (v1/v2 default). See apply_partial_unfreeze().
+            "tune_top_llm_layers": 0,
+            # VLM feature layer the head reads (E1 / 2026-06-13 review fix). Real GR00T
+            # N1.7 takes a MID layer (select_layer=12) — qwen3_backbone.py physically pops
+            # the upper LLM layers; the last layer's image-position hidden has lost its
+            # visual semantics (optimized for next-token prediction), which is poison for
+            # AlternateVLDiT's image-attending blocks. We index hidden_states[select_layer]
+            # (no model surgery → eval latency unchanged → clean single-variable test).
+            # -1 = last layer (the original v1/v2 behaviour; backward compatible). For a
+            # 24-layer Qwen3.5-4B / 36-layer Qwen3-VL-8B, 12 is the mid layer.
+            "select_layer": -1,
+            # GR00T-faithful truncation (qwen3_backbone.py:87 pops layers above
+            # select_layer BEFORE set_trainable). Required for partial-unfreeze to work:
+            # without it tune_top_llm_layers unfreezes layers[-N:] = the DISCARDED upper
+            # layers (downstream of the select_layer read) -> zero gradient -> silent
+            # no-op (E3a 2026-06-14: layers 28-31 byte-identical 3k->30k). With it,
+            # layers[-N:] = the N layers that PRODUCE the select_layer feature (8-11 for
+            # select_layer=12) and hidden_states[select_layer]==hidden_states[-1] (same
+            # value). Default False keeps full-stack E1/v1/v2 behaviour + ckpt compat.
+            "truncate_to_select_layer": False,
         }
     )
 
@@ -118,11 +141,69 @@ class Qwen_GR00T_N17(baseframework):
 
         self.action_model: FlowmatchingActionHeadN17 = get_action_model(config=self.config)
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
+        # Which VLM hidden layer the head reads (E1 review fix; -1 = last, default).
+        self.select_layer = int(getattr(self.config.framework.qwenvl, "select_layer", -1))
         # image_mask is only consumed by AlternateVLDiT; the plain-DiT ablation
         # path ignores it, so skip building (and asserting on) it there.
         self._needs_image_mask = bool(
             self.config.framework.action_model.get("use_alternate_vl_dit", True)
         )
+        # GR00T-faithful truncation (qwen3_backbone.py:87): physically pop LLM layers
+        # above select_layer so partial-unfreeze hits the USED top layers, not discarded
+        # ones. Gated by truncate_to_select_layer (default False = E1/v1/v2 full-stack).
+        if bool(getattr(self.config.framework.qwenvl, "truncate_to_select_layer", False)) \
+                and self.select_layer is not None and self.select_layer > 0:
+            _layers = self._llm_layers()
+            if _layers is not None:
+                _n0 = len(_layers)
+                while len(_layers) > self.select_layer:
+                    _layers.pop(-1)
+                logger.info(
+                    f"truncate_to_select_layer: popped LLM {_n0}->{len(_layers)} layers "
+                    f"(select_layer={self.select_layer}); layers[-N:] now feeds the head"
+                )
+            else:
+                logger.warning("truncate_to_select_layer set but LLM layers not found; no pop")
+
+    def _llm_layers(self):
+        """Locate the Qwen3-VL LLM transformer-layer ModuleList (robust to wrapper depth)."""
+        m = self.qwen_vl_interface.model
+        for path in (("model", "language_model", "layers"), ("language_model", "layers"), ("model", "layers")):
+            o = m
+            try:
+                for a in path:
+                    o = getattr(o, a)
+                return o
+            except AttributeError:
+                continue
+        return None
+
+    def apply_partial_unfreeze(self):
+        """GR00T N1.6-style partial unfreeze. Called by the trainer AFTER
+        freeze_backbones (freeze_modules=qwen_vl_interface freezes the whole VLM);
+        if `framework.qwenvl.tune_top_llm_layers > 0`, re-enable grad on the TOP N
+        Qwen3-VL LLM transformer layers so the head + top-N layers are co-trained.
+        No-op at 0 (fully-frozen head-only, the v1/v2 default).
+
+        Rationale: a frozen GENERIC web-pretrained VLM (Qwen3-VL) can't adapt its
+        features to the robot task; GR00T N1.6 unfroze top-4 of its (generic) Eagle
+        backbone for exactly this. (N1.7 re-froze because its Cosmos backbone is
+        embodiment-pretrained — not our case.) See docs design HTML §11.
+        """
+        n = int(getattr(self.config.framework.qwenvl, "tune_top_llm_layers", 0) or 0)
+        if n <= 0:
+            return
+        layers = self._llm_layers()
+        if layers is None:
+            logger.warning("apply_partial_unfreeze: could not locate LLM layers; nothing unfrozen")
+            return
+        n = min(n, len(layers))
+        cnt = 0
+        for layer in layers[-n:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+                cnt += 1
+        logger.info(f"partial unfreeze: top {n}/{len(layers)} Qwen3-VL LLM layers -> trainable ({cnt} params)")
 
     def _build_image_mask(self, qwen_inputs) -> torch.Tensor:
         """image_mask[b, s] = True where input_ids holds an image placeholder
@@ -165,7 +246,7 @@ class Qwen_GR00T_N17(baseframework):
                 output_hidden_states=True,
                 return_dict=True,
             )
-            last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
+            last_hidden = qwenvl_outputs.hidden_states[self.select_layer]  # [B, L, H]
 
         with torch.autocast("cuda", dtype=torch.float32):
             actions = torch.tensor(np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype)
@@ -233,7 +314,7 @@ class Qwen_GR00T_N17(baseframework):
                 output_hidden_states=True,
                 return_dict=True,
             )
-            last_hidden = qwenvl_outputs.hidden_states[-1]
+            last_hidden = qwenvl_outputs.hidden_states[self.select_layer]
 
         state = (
             torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
